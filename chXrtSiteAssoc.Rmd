@@ -1,0 +1,717 @@
+---
+title: "chXrtSiteAssoc.Rmd"
+author: "Griffen Mustion"
+date: "05/28/2025"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(reshape2)
+library(sjPlot)
+library(forcats)
+library(scales)
+library(table1)
+library(viridis)
+library(rlang)
+library(cowplot)
+library(compareGroups)
+
+source("toolbox.R")
+options(na.action = "na.omit")
+knitr::opts_chunk$set(message = FALSE)
+
+th <- theme(
+        axis.text = element_text(color = "black"),
+        text = element_text(family = "Arial", size = 12)
+    ) + 
+    theme_classic()
+
+theme_set(th)
+```
+
+
+# Data Preprocessing
+
+```{r}
+
+M_wide <- suppressWarnings(fread("mut_wide.tsv", sep = "\t", header = T))
+
+M_wide <- M_wide %>%
+    mutate(therapy_binary = ifelse(ind_anychemo | XRT, "treated", "untreated")) %>% 
+    mutate(race = as.character(race)) %>%
+    mutate(
+        race = if_else(race %in% c("", "UNKNOWN") | is.na(race), "Missing", race),
+        smoke = case_when(
+            smoke == 0 ~ "0",
+            smoke %in% c(1, 2) ~ "1",
+            is.na(smoke) ~ "Missing"
+        ),
+        race_b = as.integer(race == "WHITE"),
+        age_scaled = as.vector(scale(age))
+    ) %>%
+    mutate(Gender = if_else(Gender == "M", "Male", "Female")) %>%
+    mutate(mutnum_pancan_pd_r = case_when(
+        mutnum_pancan_pd == 0 ~ 0,
+        mutnum_pancan_pd == 1 ~ 1,
+        mutnum_pancan_pd >= 2 ~ 2
+    )) %>%
+    mutate(VAF_pancan_pd_r = case_when(
+        VAF_pancan_pd == 0 ~ 0,
+        VAF_pancan_pd <= .05 ~ 1,
+        VAF_pancan_pd <= .10 ~ 2,
+        VAF_pancan_pd <= .20 ~ 3,
+        VAF_pancan_pd > .20 ~ 4
+    )) %>%
+    mutate(race = case_when(
+        is.na(race) ~ "Missing",
+        race == "MISSING/OTHER" ~ "Other",
+        T ~ tools::toTitleCase(tolower(race))
+    )) %>%
+    mutate(
+        Gender = relevel(factor(Gender), ref = "Male"),
+        race = relevel(factor(race), ref = "White"),
+        SystemTumorType = relevel(factor(SystemTumorType), ref = "Lung"),
+        smoke = relevel(factor(smoke), ref = "0"),
+        smoke_bin = relevel(factor(smoke_bin), ref = "0"),
+        therapy_binary = relevel(factor(therapy_binary), ref = "untreated"),
+        eqd_3_10 = eqd_3 / 10
+    ) %>%
+    mutate(
+        pack_yr = ifelse(is.na(pack_yr), 0, pack_yr),
+        pack_yr = cut(
+            pack_yr,
+            breaks = c(0, 0.001, 1, 2, 5, 10, 20, 30, 40, 50, 100, Inf),
+            labels = c(0, 0.001, 1, 2, 5, 10, 20, 30, 40, 50, 100),
+            right = FALSE
+        )
+    )
+
+M_wide$modality[M_wide$modality == ""] <- NA
+M_wide$modality <- factor(M_wide$modality, levels = c("IMRT", "3D", "Conventional", "VMAT", "Multiple", "Unknown"))
+
+M_wide <- M_wide %>%
+    mutate(
+        eqd_3pelvis_100 = eqd_3pelvis / 100,
+        eqd_3abdomen_100 = eqd_3abdomen / 100,
+        eqd_3brain_100 = eqd_3brain / 100,
+        eqd_3cw_breast_100 = eqd_3cw_breast / 100,
+        eqd_3head_neck_100 = eqd_3head_neck / 100,
+        eqd_3prostate_100 = eqd_3prostate / 100,
+        eqd_3rib_scap_stern_100 = eqd_3rib_scap_stern / 100,
+        eqd_3spine_100 = eqd_3spine / 100,
+        eqd_3thorax_100 = eqd_3thorax / 100,
+        eqd_3unknown_100 = eqd_3unknown / 100,
+        eqd_3arm_leg_100 = eqd3_arm_leg / 100
+    ) %>%
+    rowwise() %>%
+    mutate(
+        DDR = any(PPM1D, TP53, ATM, CHEK2, na.rm = TRUE),
+        DTA = any(DNMT3A, TET2, ASXL1, na.rm = TRUE)
+    ) %>%
+    filter(txMSK == 1)
+```
+
+
+# Table of Characteristics
+
+```{r, message = FALSE, warning = FALSE}
+# Table using compare groups
+
+d <- M_wide %>% filter(XRT == 1 & !is.na(time_end_xrt))
+
+rare_tumors <- d %>%
+    group_by(generaltumortype) %>%
+    summarise(count = n_distinct(MRN)) %>%
+    arrange(-count)  %>%
+    filter(count < 50) %>%
+    pull(generaltumortype) %>%
+    as.character()
+
+d <- d %>% mutate(generaltumortype_r = ifelse(generaltumortype %in% rare_tumors, "Other", as.character(generaltumortype)))
+
+d$Gender <- factor(d$Gender, levels = c("Female","Male"), labels = c("Female","Male"))
+d$ch_status <- factor(
+    if_else(d$DDR == 1, "DDR CH-PD", if_else(d$ch_pancan_pd == 1, "Non-DDR CH-PD", "No CH-PD")),
+    levels = c("No CH-PD", "Non-DDR CH-PD", "DDR CH-PD")
+)
+
+label(d$site) <- "Anatomic site"
+label(d$modality) <- "Modality"
+label(d$age) <- "Age (yrs)"
+label(d$time_end_xrt) <- "Days between XRT and blood draw"
+label(d$generaltumortype_r) <- "Primary Tumor Subtype"
+
+d$ch_pancan_pd <- factor(d$ch_pancan_pd, levels = c("0", "1"), labels = c("No CH-PD","CH-PD Mutation"))
+label(d$ch_pancan_pd) <- "CH-PD"
+
+mycg <- function(formula, data, format = "markdown") {
+    tbl <- createTable(compareGroups(
+            formula,
+            data = data,
+            byrow = TRUE,            # sum by rows
+            simplify = FALSE,        # do not drop empty categories
+            include.miss = FALSE,     # show missingness
+            method = 2,              # always show median [IQR] for continuous values
+            max.xlev = 50,
+            max.ylev = 10
+        ),  # do not drop variables with >5 categories
+        show.p.overall = FALSE,  # no p-values in table 1 please
+        show.ratio = FALSE,      # ... or odds ratios
+        show.p.ratio = FALSE,    # ... really, no p-values
+        show.all = TRUE
+    )
+    if (format == "markdown") {
+        return(export2md(tbl, strip = TRUE, caption = "")) # show [ALL] column not broken down by main exposure
+    }
+    else {
+        return(as.data.frame(getResults(tbl)))
+    }
+  
+}
+
+tbl <- mycg(
+    formula = ch_status ~ Gender + age + generaltumortype_r + time_end_xrt + modality + site,
+    data = d,
+    format = "tbl"
+)
+tbl
+
+write.csv(tbl, file = "table/summary_table.csv", row.names = TRUE)
+```
+
+
+```{r}
+
+chemo <- d %>%
+    select(
+        MRN,
+        ch_status,
+        ind_taxane,
+        ind_microtubule_damaging,
+        ind_antimetabolite,
+        ind_alkylating_agent,
+        ind_carboplatin,
+        ind_cisplatin,
+        ind_oxaliplatin,
+        ind_topoisomerase_i_inhi,
+        ind_topoisomerase_ii_inh,
+        ind_cytotoxic_therapy_ot,
+        ind_radiotherapy,
+        ind_targeted_therapy,
+        ind_immune_therapy
+    ) %>%
+    rowwise() %>%
+    mutate(row_sum = sum(c_across(-c(MRN, ch_status)), na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(no_chem = as.integer(row_sum == 0)) %>%
+    select(-row_sum) %>%
+    mutate(across(ind_taxane:no_chem, ~if_else(. == 1, "T", "F"))) %>%
+    filter()
+
+tbl <- mycg(
+        formula = ch_status ~ ind_taxane + 
+            ind_microtubule_damaging + 
+            ind_antimetabolite + 
+            ind_alkylating_agent + 
+            ind_carboplatin + 
+            ind_cisplatin + 
+            ind_oxaliplatin + 
+            ind_topoisomerase_i_inhi + 
+            ind_topoisomerase_ii_inh + 
+            ind_cytotoxic_therapy_ot + 
+            ind_radiotherapy + 
+            ind_targeted_therapy + 
+            ind_immune_therapy +
+            no_chem,
+        data = chemo,
+        format = "tbl"
+    )
+
+tbl <- tbl[grep("T", rownames(tbl)), ]
+tbl
+
+write.csv(tbl, file = "table/chemo_table.csv", row.names = TRUE)
+```
+
+
+# Assoc w/ DDR-CH by RT site
+
+```{r}
+
+# Rib/Scapula/Sternum were removed from further analysis due to inadequate data
+# pct_cytotoxic_therapy_ot removed from analysis due to large std error
+
+formula_base <- paste(
+    # "pct_cytotoxic_therapy_ot",
+    "pct_taxane",
+    "pct_microtubule_damaging",
+    "pct_antimetabolite",
+    "pct_alkylating_agent",
+    "pct_carboplatin",
+    "pct_cisplatin",
+    "pct_oxaliplatin",
+    "pct_topoisomerase_i_inhi",
+    "pct_topoisomerase_ii_inh",
+    "pct_radiotherapy",
+    "pct_targeted_therapy",
+    "pct_immune_therapy",
+    "eqd_3abdomen_100",
+    "eqd_3brain_100",
+    "eqd_3cw_breast_100",
+    "eqd_3head_neck_100",
+    "eqd_3pelvis_100",
+    "eqd_3prostate_100",
+    "eqd_3spine_100",
+    "eqd_3thorax_100",
+    "eqd_3unknown_100",
+    "eqd_3arm_leg_100",
+    "age",
+    "smoke_bin",
+    "race_b",
+    "timedx_impact",
+sep = " + ")
+
+rad_site_list <- c(
+    "eqd_3abdomen_100",
+    "eqd_3brain_100",
+    "eqd_3cw_breast_100",
+    "eqd_3head_neck_100",
+    "eqd_3pelvis_100",
+    "eqd_3prostate_100",
+    "eqd_3spine_100",
+    "eqd_3thorax_100",
+    "eqd_3arm_leg_100"
+)
+
+labels <- list(
+    "Eqd 3abdomen 100" = "Abdomen", 
+    "Eqd 3head Neck 100" = "Head/Neck", 
+    "Eqd 3pelvis 100" = "Pelvis", 
+    "Eqd 3brain 100" = "Brain", 
+    "Eqd 3thorax 100" = "Thorax", 
+    "Eqd 3prostate 100" = "Prostate", 
+    "Eqd 3spine 100" = "Spine", 
+    "Eqd 3arm Leg 100" = "Arm/Leg", 
+    "Eqd 3cw Breast 100" = "Breast"
+)
+
+M_extended <- M_wide %>%
+    rowwise() %>%
+    mutate(
+        DDR = any(PPM1D, TP53, ATM, CHEK2, na.rm=TRUE),
+        nonDDR = if_else(ch_pancan_pd & !DDR, 1L, 0L)
+    )
+
+resCH <- M_extended %>%
+    glm(formula = paste0("ch_pancan_pd ~ ", formula_base), family = binomial(link = "logit"), na.action = "na.omit") %>%
+    sjPlot::get_model_data(type="est") %>%
+    filter(str_detect(term, paste(rad_site_list, collapse = "|"))) %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = recode(term, !!!labels)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)])))
+
+resDDR <- M_extended %>%
+    glm(formula = paste0("DDR ~ ", formula_base), family = binomial(link = "logit"), na.action = "na.omit") %>%
+    sjPlot::get_model_data(type="est") %>%
+    filter(str_detect(term, paste(rad_site_list, collapse = "|"))) %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = recode(term, !!!labels)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)])))
+
+p1 <- resCH %>%
+    plot_forest(
+        x = "term",
+        eb_w = 0,
+        eb_s = 2,
+        ps = 3,
+        or_s = 4
+    ) +
+    xlab("Irradiated anatomic site") +
+    ylab("Odds Ratio of nonDDR-CH")
+
+p2 <- resDDR %>%
+    plot_forest(
+        x = "term",
+        eb_w = 0,
+        eb_s = 2,
+        ps = 3,
+        or_s = 4
+    ) +
+    xlab("Irradiated anatomic site") +
+    ylab("Odds Ratio of DDR-CH")
+
+combined_plot <- plot_grid(
+    p1, p2,
+    align = "hv",
+    ncol = 2
+)
+
+combined_plot
+
+ggsave(combined_plot, file="plots/nonDDR_vs_DDR_CH.png", width=10, height=5, dpi=300)
+```
+
+```{r}
+# Create DDR-CH forest plot for final figure
+
+p1 <- resDDR %>%
+    plot_forest(
+        x = "term",
+        eb_w = 0,
+        eb_s = 2,
+        ps = 3,
+        or_s = 4
+    ) +
+    xlab("Irradiated anatomic site") +
+    ylab("Odds Ratio of DDR-CH") +
+    scale_color_manual(values = pal_nejm()(4)[3:4]) +
+    ggtitle("A")
+
+p1
+
+```
+
+
+# Gene x RT Site Assoc
+
+```{r}
+
+# Considering the most commonly mutated DDR and non-DDR genes
+# Removed variable with highest std error until all models successfully converged
+
+formula_base <- paste(
+    # "pct_cytotoxic_therapy_ot",
+    # "pct_radiotherapy",
+    # "pct_microtubule_damaging",
+    # "pct_cisplatin",
+    "pct_taxane",
+    "pct_antimetabolite",
+    "pct_alkylating_agent",
+    "pct_carboplatin",
+    "pct_oxaliplatin",
+    "pct_topoisomerase_i_inhi",
+    "pct_topoisomerase_ii_inh",
+    "pct_targeted_therapy",
+    "pct_immune_therapy",
+    "age",
+    "smoke_bin",
+    "race_b",
+    "timedx_impact",
+    sep = " + "
+)
+
+site_names <- c(
+    "eqd_3abdomen_100" = "Abdomen",
+    "eqd_3arm_leg_100" = "Arm/Leg",
+    "eqd_3brain_100" = "Brain",
+    "eqd_3cw_breast_100" = "Breast",
+    "eqd_3head_neck_100" = "Head/Neck",
+    "eqd_3pelvis_100" = "Pelvis",
+    "eqd_3prostate_100" = "Prostate",
+    "eqd_3spine_100" = "Spine",
+    "eqd_3thorax_100" = "Thorax"
+)
+
+gene_list <- c("DNMT3A", "TET2", "ASXL1", "PPM1D", "TP53", "CHEK2", "ATM", "JAK2", "SF3B1", "SRSF2")
+heat_df <- data.frame(xrt_site = character(), Gene = character(), OR = numeric(), P_val = numeric(), n = numeric())
+
+for (site in names(site_names)) {
+    for (gene in gene_list) {
+        
+        formula <- paste(gene, "~", site, "+", formula_base, sep = " ")
+        logistic_model <- glm(formula, data = M_wide, family = "binomial")
+        
+        new_row <- data.frame(
+            xrt_site = site_names[site],
+            Gene = gene,
+            OR = exp(coefficients(logistic_model)[site]),
+            P_val = summary(logistic_model)$coefficients[,4][site],
+            n = as.integer(M_wide %>% filter(!!sym(gene) == 1 & !!sym(site) > 0) %>% nrow())
+        )
+        
+        heat_df <- rbind(heat_df, new_row)
+    }
+}
+
+heat_df <- heat_df %>%
+    mutate(
+        Gene = factor(Gene, levels = c("PPM1D", "TP53", "CHEK2", "ATM", "DNMT3A", "TET2", "ASXL1", "JAK2", "SF3B1", "SRSF2")),
+        DDR = if_else(Gene %in% c("PPM1D", "TP53", "CHEK2", "ATM"), "DDR-CH", "non-DDR-CH"),
+        xrt_site = factor(
+            xrt_site,
+            levels = rev(c("Abdomen", "Head/Neck", "Pelvis", "Brain", "Thorax", "Prostate", "Spine", "Arm/Leg", "Breast"))
+        )
+    )
+
+```
+
+
+```{r}
+
+p2 <- heat_df %>%
+    filter(Gene != "SRSF2") %>%
+    mutate(
+        P_cat = factor(cut(
+          P_val,
+          breaks = c(0, 0.05, 0.2, 1),
+          labels = c("< 0.05", "0.05-0.2", "> 0.2"),
+          include.lowest = TRUE,
+          right = FALSE
+        ), levels = c( "> 0.2", "0.05-0.2", "< 0.05")),
+        P_stars = case_when(
+            P_val < 0.001 ~ "***",
+            P_val < 0.01 ~ "**",
+            P_val < 0.05 ~ "*",
+            TRUE ~ "",
+        )
+    ) %>%
+ggplot(aes(Gene, xrt_site, fill = OR, color = OR)) +
+    geom_tile(width = 0.001, height = 0.001, alpha = 0, color = "white", fill = "white") +
+    geom_point(aes(size = P_cat), shape = 15) +
+    scale_size_manual(values = c(4, 6.5, 9)) +
+    guides(size = guide_legend(reverse = TRUE)) +
+    geom_point(data = heat_df %>% filter(n == 0 & Gene != "SRSF2"), size = 5, color = "white", fill = "white", shape = 15, na.rm = TRUE, show.legend = F) +
+    geom_text(aes(label = P_stars), size = 5, color = "black", fill = "black", vjust = 0.7, family = "Arial") +
+    scale_fill_viridis(discrete=FALSE) +
+    scale_color_viridis(discrete=FALSE) +
+    theme_bw() +
+    theme(
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black", angle = 45, hjust = 1, vjust = 1),
+        axis.ticks = element_line(linewidth = 0.5),
+    ) +
+    labs(title = "", x = "", y = "", z = "", fill = "OR", size = "p-value") +
+    guides(fill = guide_colourbar(barwidth = 1, barheight = 8)) + 
+    ggtitle("B") +
+    facet_grid(~DDR, scales = "free_x", space = "free_x")
+
+p2
+```
+
+
+
+```{r}
+# Combine plots into final figure
+
+final_plot <- plot_grid(
+    p1, p2,
+    align = "hv",
+    ncol = 2,
+    rel_widths = c(1, 1.2)
+)
+
+final_plot
+
+ggsave(final_plot, file="plots/OR_by_XRTsite.png", width=10, height=5, dpi=300)
+```
+
+# Supplemental Materials
+
+```{r}
+# For those RT sites which were found to be significantly assoc with DDR-CH,
+# which are associated with number of CH mutations and maxVAF
+# Adjust for same set of variables as previous
+
+var_list <- paste(
+    # "pct_cytotoxic_therapy_ot",
+    "pct_taxane",
+    "pct_microtubule_damaging",
+    "pct_antimetabolite",
+    "pct_alkylating_agent",
+    "pct_carboplatin",
+    "pct_cisplatin",
+    "pct_oxaliplatin",
+    "pct_topoisomerase_i_inhi",
+    "pct_topoisomerase_ii_inh",
+    "pct_radiotherapy",
+    "pct_targeted_therapy",
+    "pct_immune_therapy",
+    "eqd_3abdomen_100",
+    "eqd_3brain_100",
+    "eqd_3cw_breast_100",
+    "eqd_3head_neck_100",
+    "eqd_3pelvis_100",
+    "eqd_3prostate_100",
+    "eqd_3spine_100",
+    "eqd_3thorax_100",
+    "eqd_3unknown_100",
+    "eqd_3arm_leg_100",
+    "age",
+    "smoke_bin",
+    "race_b",
+    "timedx_impact",
+    sep = " + "
+)
+
+rad_site_dict <- c(
+    "Eqd 3abdomen 100" = "Abdomen",
+    "Eqd 3brain 100" = "Brain",
+    "Eqd 3cw breast 100" = "Breast",
+    "Eqd 3head Neck 100" = "Head/Neck",
+    "Eqd 3pelvis 100" = "Pelvis",
+    "Eqd 3prostate 100" = "Prostate",
+    "Eqd 3spine 100" = "Spine",
+    "Eqd 3thorax 100" = "Thorax",
+    "Eqd 3arm leg 100" = "Arm/Leg"
+)
+
+M_extended <- M_wide %>%
+    rowwise() %>%
+    mutate(
+        nCH = mutnum_pancan_pd,
+        maxVAF = VAF_pancan_pd,
+        DDR_nCH = sum(c(PPM1D, TP53, ATM, CHEK2), na.rm = TRUE),
+        DDR_maxVAF = if_else(DDR_nCH > 0, VAF_pancan_pd, 0),
+        total_eqd_3_100 = rowSums(across(all_of(rad_site_list)), na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    filter(ch_pancan_pd == 1)
+
+res1 <- M_extended %>%
+    glm(formula = paste0("nCH ~ ", var_list), family = gaussian, na.action = "na.omit") %>%
+    sjPlot::get_model_data(type="est") %>%
+    filter(str_detect(term, paste(rad_site_list, collapse = "|"))) %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)]))) %>%
+    mutate(outcome = "nCH", CH_Group = "All")
+
+res2 <- M_extended %>%
+    glm(formula = paste0("maxVAF ~ ", var_list), family = gaussian, na.action = "na.omit") %>%
+    sjPlot::get_model_data(type="est") %>%
+    filter(str_detect(term, paste(rad_site_list, collapse = "|"))) %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)]))) %>%
+    mutate(outcome = "maxVAF", CH_Group = "All")
+
+res3 <- M_extended %>%
+    glm(formula = paste0("DDR_nCH ~ ", var_list), family = gaussian, na.action = "na.omit") %>%
+    sjPlot::get_model_data(type="est") %>%
+    filter(str_detect(term, paste(rad_site_list, collapse = "|"))) %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)]))) %>%
+    mutate(outcome = "nCH", CH_Group = "DDR")
+
+res4 <- M_extended %>%
+    glm(formula = paste0("DDR_maxVAF ~ ", var_list), family = gaussian, na.action = "na.omit") %>%
+    sjPlot::get_model_data(type="est") %>%
+    filter(str_detect(term, paste(rad_site_list, collapse = "|"))) %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)]))) %>%
+    mutate(outcome = "maxVAF", CH_Group = "DDR")
+
+res <- rbind(res1, res2, res3, res4) %>%
+    mutate(term = recode(term, !!!rad_site_dict))
+
+
+p1 <- res %>%
+    filter(term %in% c("Head/Neck", "Pelvis", "Brain", "Thorax")) %>%
+    filter(CH_Group == "DDR", outcome == "nCH") %>%
+    group_by(term) %>%
+    mutate(order_value = estimate[CH_Group == "DDR"]) %>%
+    ungroup() %>%
+    mutate(
+        term = fct_reorder(term, -order_value, .desc = TRUE),
+        CH_Group = factor(CH_Group, rev(c("All", "DDR")))
+    ) %>%
+ggplot(aes(x = estimate, y = term, xmin = conf.low, xmax = conf.high)) +
+    geom_vline(xintercept = 0, color = "gray", linetype = "solid") +
+    geom_errorbar(position = position_dodge(width = 0.8), width = 0, size = 2) +
+    geom_point(position = position_dodge(width = 0.8), size = 3) +
+    geom_text(aes(label = p.stars, vjust = 0), position = position_dodge(width = 0.8), color = "black", size = 4) +
+    labs(title = "Number of CH mutations", x = "Beta Coefficient of DDR-CH", y = "Irradiated anatomic site") +
+    scale_color_nejm(breaks = c("All", "DDR")) + scale_fill_nejm(breaks = c("All", "DDR")) +
+    theme(legend.position="none")
+
+p2 <- res %>%
+    filter(term %in% c("Head/Neck", "Pelvis", "Brain", "Thorax")) %>%
+    filter(CH_Group == "DDR", outcome == "maxVAF") %>%
+    group_by(term) %>%
+    mutate(order_value = estimate[CH_Group == "DDR"]) %>%
+    ungroup() %>%
+    mutate(
+        term = fct_reorder(term, -order_value, .desc = TRUE),
+        CH_Group = factor(CH_Group, rev(c("All", "DDR")))
+    ) %>%
+ggplot(aes(x = estimate, y = term, xmin = conf.low, xmax = conf.high)) +
+    geom_vline(xintercept = 0, color = "gray", linetype = "solid") +
+    geom_errorbar(position = position_dodge(width = 0.8), width = 0, size = 2) +
+    geom_point(position = position_dodge(width = 0.8), size = 3) +
+    geom_text(aes(label = p.stars, vjust = 0), position = position_dodge(width = 0.8), color = "black", size = 4) +
+    labs(title = "Maximum VAF of a CH mutation", x = "Beta Coefficient of DDR-CH", y = "") +
+    scale_color_nejm(breaks = c("All", "DDR")) +  scale_fill_nejm(breaks = c("All", "DDR")) +
+    theme(legend.position="none")
+
+final_plot <- plot_grid(
+    p1, p2,
+    align = "hv",
+    ncol = 2,
+    rel_widths = c(1, 1)
+)
+
+final_plot
+
+ggsave(final_plot, file="plots/nCH_maxVAF.png", width=10, height=5, dpi=300)
+```
+
+```{r}
+# Assoc between total RT dose across all sites w/ number of CH mutations and maxVAF
+
+var_list <- paste(
+    # "pct_cytotoxic_therapy_ot",
+    "pct_taxane",
+    "pct_microtubule_damaging",
+    "pct_antimetabolite",
+    "pct_alkylating_agent",
+    "pct_carboplatin",
+    "pct_cisplatin",
+    "pct_oxaliplatin",
+    "pct_topoisomerase_i_inhi",
+    "pct_topoisomerase_ii_inh",
+    "pct_radiotherapy",
+    "pct_targeted_therapy",
+    "pct_immune_therapy",
+    "total_eqd_3_100",
+    "age",
+    "smoke_bin",
+    "race_b",
+    "timedx_impact",
+    sep = " + "
+)
+
+res1 <- M_extended %>%
+    glm(formula = paste0("nCH ~ ", var_list), family = gaussian, na.action = "na.omit") %>%
+    sjPlot::get_model_data(type = "est") %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)]))) %>%
+    mutate(outcome = "nCH", CH_Group = "All")
+
+res2 <- M_extended %>%
+    glm(formula = paste0("maxVAF ~ ", var_list), family = gaussian, na.action = "na.omit") %>%
+    sjPlot::get_model_data(type = "est") %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)]))) %>%
+    mutate(outcome = "maxVAF", CH_Group = "All")
+
+res3 <- M_extended %>%
+    glm(formula = paste0("DDR_nCH ~ ", var_list), family = gaussian, na.action = "na.omit") %>%
+    sjPlot::get_model_data(type = "est") %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)]))) %>%
+    mutate(outcome = "nCH", CH_Group = "DDR")
+
+res4 <- M_extended %>%
+    glm(formula = paste0("DDR_maxVAF ~ ", var_list), family = gaussian, na.action = "na.omit") %>%
+    sjPlot::get_model_data(type = "est") %>%
+    mutate(term = format_variable(term)) %>%
+    mutate(term = factor(term, levels = unique(term[order(estimate)]))) %>%
+    mutate(outcome = "maxVAF", CH_Group = "DDR")
+
+res <- rbind(res1, res2, res3, res4) %>%
+    filter(term == "Total Eqd 3 100")
+
+res
+```
+
+
