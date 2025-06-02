@@ -72,7 +72,6 @@ M_wide <- M_wide %>%
     mutate(
         Gender = relevel(factor(Gender), ref = "Male"),
         race = relevel(factor(race), ref = "White"),
-        SystemTumorType = relevel(factor(SystemTumorType), ref = "Lung"),
         smoke = relevel(factor(smoke), ref = "0"),
         smoke_bin = relevel(factor(smoke_bin), ref = "0"),
         therapy_binary = relevel(factor(therapy_binary), ref = "untreated"),
@@ -123,7 +122,7 @@ d <- M_wide %>% filter(XRT == 1 & !is.na(time_end_xrt))
 
 rare_tumors <- d %>%
     group_by(generaltumortype) %>%
-    summarise(count = n_distinct(MRN)) %>%
+    summarise(count = n_distinct(rowID)) %>%
     arrange(-count)  %>%
     filter(count < 50) %>%
     pull(generaltumortype) %>%
@@ -186,7 +185,7 @@ write.csv(tbl, file = "table/summary_table.csv", row.names = TRUE)
 
 chemo <- d %>%
     select(
-        MRN,
+        rowID,
         ch_status,
         ind_taxane,
         ind_microtubule_damaging,
@@ -203,7 +202,7 @@ chemo <- d %>%
         ind_immune_therapy
     ) %>%
     rowwise() %>%
-    mutate(row_sum = sum(c_across(-c(MRN, ch_status)), na.rm = TRUE)) %>%
+    mutate(row_sum = sum(c_across(-c(rowID, ch_status)), na.rm = TRUE)) %>%
     ungroup() %>%
     mutate(no_chem = as.integer(row_sum == 0)) %>%
     select(-row_sum) %>%
